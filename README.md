@@ -2,6 +2,10 @@
 
 基于 React + Vite + Tailwind CSS 的外箱尺寸推荐工具，支持根据单个商品尺寸和打包数量，计算最接近正方体的排列方案。
 
+## 在线地址
+
+https://tk-tools.vercel.app/
+
 ## 本地运行
 
 ```bash
