@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { Box, Package } from "lucide-react";
 import { parseLayoutSegments } from "./lib/packing";
 import { calculateCnyToUsd } from "./lib/pricing";
@@ -35,6 +35,10 @@ import {
   resolveLayoutSegments,
   toCurrencyText,
 } from "./app/helpers";
+import {
+  loadPersistedAppState,
+  savePersistedAppState,
+} from "./app/persistence";
 import type {
   ResolvedLayoutLayer,
   SkuConfig,
@@ -45,9 +49,10 @@ import ResultSummaryPanel from "./components/ResultSummaryPanel";
 import SkuListSidebar from "./components/SkuListSidebar";
 
 const App = () => {
-  const [skus, setSkus] = useState<SkuConfig[]>([createDefaultSku(1)]);
-  const [activeSkuId, setActiveSkuId] = useState("sku-1");
-  const [nextSkuIndex, setNextSkuIndex] = useState(2);
+  const initialPersistedState = useMemo(() => loadPersistedAppState(), []);
+  const [skus, setSkus] = useState<SkuConfig[]>(initialPersistedState.skus);
+  const [activeSkuId, setActiveSkuId] = useState(initialPersistedState.activeSkuId);
+  const [nextSkuIndex, setNextSkuIndex] = useState(initialPersistedState.nextSkuIndex);
   const flatRatePerKgByChannel = defaultFlatRatePerKgByChannel;
   const airExpressRateTable: AirExpressRateTable = defaultAirExpressRateTable;
   const [expressSeaRateTable] = useState<ExpressSeaRateTable>(
@@ -95,6 +100,14 @@ const App = () => {
       return next;
     });
   };
+
+  useEffect(() => {
+    savePersistedAppState({
+      skus,
+      activeSkuId,
+      nextSkuIndex,
+    });
+  }, [activeSkuId, nextSkuIndex, skus]);
 
   const activeComputed = useMemo(
     () =>
