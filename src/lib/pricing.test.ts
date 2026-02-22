@@ -107,17 +107,58 @@ describe("calculateFirstLegCostFromRate", () => {
 
 describe("calculateTargetSellingPrice", () => {
   it("supports margin rate based on selling price", () => {
-    const price = calculateTargetSellingPrice(70, 0.3, "margin_on_sale_price");
+    const price = calculateTargetSellingPrice(70, 0.3, "margin_on_sale_price", {
+      returnRate: 0,
+      discountRate: 1,
+    });
     expect(price).toBe(100);
   });
 
   it("supports markup rate based on cost", () => {
-    const price = calculateTargetSellingPrice(70, 0.3, "markup_on_cost");
+    const price = calculateTargetSellingPrice(70, 0.3, "markup_on_cost", {
+      returnRate: 0,
+      discountRate: 1,
+    });
     expect(price).toBe(91);
   });
 
+  it("raises required price when return rate is applied", () => {
+    const price = calculateTargetSellingPrice(70, 0.3, "margin_on_sale_price", {
+      returnRate: 0.1,
+      discountRate: 1,
+    });
+    expect(price).toBe(111.11);
+  });
+
+  it("raises required list price when discount is applied", () => {
+    const price = calculateTargetSellingPrice(70, 0.3, "margin_on_sale_price", {
+      returnRate: 0.1,
+      discountRate: 0.8,
+    });
+    expect(price).toBe(138.89);
+  });
+
   it("returns null when sale-based margin is 100% or above", () => {
-    const price = calculateTargetSellingPrice(70, 1, "margin_on_sale_price");
+    const price = calculateTargetSellingPrice(70, 1, "margin_on_sale_price", {
+      returnRate: 0,
+      discountRate: 1,
+    });
+    expect(price).toBeNull();
+  });
+
+  it("returns null when return rate is 100% or above", () => {
+    const price = calculateTargetSellingPrice(70, 0.3, "margin_on_sale_price", {
+      returnRate: 1,
+      discountRate: 1,
+    });
+    expect(price).toBeNull();
+  });
+
+  it("returns null when discount rate is zero or below", () => {
+    const price = calculateTargetSellingPrice(70, 0.3, "margin_on_sale_price", {
+      returnRate: 0.1,
+      discountRate: 0,
+    });
     expect(price).toBeNull();
   });
 });
@@ -141,12 +182,16 @@ describe("summarizePricing", () => {
       },
       targetRate: 0.25,
       targetRateMode: "margin_on_sale_price",
+      returnRate: 0.1,
+      discountRate: 0.8,
     });
 
     expect(summary.totalCost).toBe(30);
     expect(summary.volumetricWeightKg).toBe(4);
     expect(summary.chargeableWeightKg).toBe(4);
-    expect(summary.predictedSellingPrice).toBe(40);
+    expect(summary.predictedSellingPrice).toBe(55.56);
+    expect(summary.discountedSellingPrice).toBe(44.44);
+    expect(summary.effectiveRevenueAfterReturns).toBe(40);
     expect(summary.estimatedProfit).toBe(10);
     expect(summary.profitRateOnSalePrice).toBe(0.25);
     expect(summary.markupOnCost).toBeCloseTo(0.333333, 5);

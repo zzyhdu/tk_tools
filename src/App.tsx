@@ -12,7 +12,9 @@ import {
 } from "lucide-react";
 import {
   calculatePackingResults,
-  getNormalizedPreviewDimensions,
+  getNormalizedLayerGridPreview,
+  parseLayoutSegments,
+  type PackingLayoutSegment,
   type PackingDims,
   type PackingResult,
 } from "./lib/packing";
@@ -78,6 +80,8 @@ type SkuConfig = {
   firstLegChannel: FirstLegChannel;
   targetRateMode: TargetRateMode;
   targetRatePercent: number;
+  returnRatePercent: number;
+  discountRatePercent: number;
   costs: SkuBaseCosts;
 };
 
@@ -96,6 +100,23 @@ type SkuComputed = {
     heightCm: number;
   };
   effectiveSelectedIndex: number;
+};
+
+type ResolvedLayoutLayer = PackingLayoutSegment & {
+  countAlongLength: number;
+  countAlongWidth: number;
+  nxAxis: "L" | "W";
+  nyAxis: "L" | "W";
+  layerHeight: number;
+};
+
+type ResolvedLayoutSegment = PackingLayoutSegment & {
+  countAlongLength: number;
+  countAlongWidth: number;
+  nxAxis: "L" | "W";
+  nyAxis: "L" | "W";
+  singleLayerHeight: number;
+  segmentHeight: number;
 };
 
 const FIRST_LEG_CHANNEL_OPTIONS: Array<{
@@ -151,6 +172,8 @@ const createDefaultSku = (index: number): SkuConfig => ({
   firstLegChannel: "fbt_us_standard_sea_truck",
   targetRateMode: "margin_on_sale_price",
   targetRatePercent: 25,
+  returnRatePercent: 10,
+  discountRatePercent: 100,
   costs: {
     sourceToHomeExpressCost: 0,
     domesticWarehouseExpressCost: 0,
@@ -163,9 +186,277 @@ const toCurrencyText = (value: number | null): string =>
   value === null ? "--" : value.toFixed(2);
 const toPercentText = (value: number | null): string =>
   value === null ? "--" : `${(value * 100).toFixed(2)}%`;
+const toDimensionText = (value: number): string => {
+  if (!Number.isFinite(value)) {
+    return "--";
+  }
+
+  const rounded = Math.round(value * 100) / 100;
+  if (Number.isInteger(rounded)) {
+    return `${rounded}`;
+  }
+
+  return rounded.toFixed(2).replace(/\.?0+$/, "");
+};
 
 const clampNonNegative = (value: number): number =>
   Number.isFinite(value) && value > 0 ? value : 0;
+
+const clampPercent = (value: number, max: number = 100): number => {
+  if (!Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+
+  return Math.min(value, max);
+};
+
+const getLayerLabel = (index: number, total: number): string => {
+  if (total <= 1) {
+    return "整层";
+  }
+  if (index === 0) {
+    return "底层";
+  }
+  if (index === total - 1) {
+    return "顶层";
+  }
+
+  return `中层${index}`;
+};
+
+const getGridDividerRatios = (count: number, maxDividers = 8): number[] => {
+  const safeCount = Number.isFinite(count) ? Math.max(1, Math.floor(count)) : 1;
+  if (safeCount <= 1) {
+    return [];
+  }
+
+  const step = Math.max(1, Math.ceil(safeCount / Math.max(1, maxDividers)));
+  const dividers: number[] = [];
+  for (let i = step; i < safeCount; i += step) {
+    dividers.push(i / safeCount);
+  }
+
+  return dividers;
+};
+
+const getBoundaryRatiosByValues = (values: number[]): number[] => {
+  const safeValues = values.map((value) => (Number.isFinite(value) && value > 0 ? value : 0));
+  const total = safeValues.reduce((sum, value) => sum + value, 0);
+  if (total <= 0 || safeValues.length <= 1) {
+    return [];
+  }
+
+  let accumulated = 0;
+  const boundaries: number[] = [];
+  for (let i = 0; i < safeValues.length - 1; i += 1) {
+    accumulated += safeValues[i];
+    boundaries.push(accumulated / total);
+  }
+
+  return boundaries;
+};
+
+const getUniqueUnitOrientations = (
+  dims: PackingDims,
+): Array<{ length: number; width: number; height: number }> => {
+  const permutations: Array<[number, number, number]> = [
+    [dims.length, dims.width, dims.height],
+    [dims.length, dims.height, dims.width],
+    [dims.width, dims.length, dims.height],
+    [dims.width, dims.height, dims.length],
+    [dims.height, dims.length, dims.width],
+    [dims.height, dims.width, dims.length],
+  ];
+  const unique: Array<{ length: number; width: number; height: number }> = [];
+  const seen = new Set<string>();
+
+  for (const [length, width, height] of permutations) {
+    const key = `${length},${width},${height}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    unique.push({ length, width, height });
+  }
+
+  return unique;
+};
+
+const getRelativeError = (actual: number, expected: number): number => {
+  if (!Number.isFinite(actual) || !Number.isFinite(expected) || actual <= 0 || expected <= 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return Math.abs(actual - expected) / expected;
+};
+
+const resolveLayerDirection = (
+  layer: PackingLayoutSegment,
+  boxDims: { l: number; w: number; h: number },
+  unitDims: PackingDims,
+): {
+  countAlongLength: number;
+  countAlongWidth: number;
+  nxAxis: "L" | "W";
+  nyAxis: "L" | "W";
+  inferredLayerHeight: number;
+} => {
+  const safeNx = Math.max(1, Number.isFinite(layer.nx) ? Math.floor(layer.nx) : 1);
+  const safeNy = Math.max(1, Number.isFinite(layer.ny) ? Math.floor(layer.ny) : 1);
+  const candidates: Array<{
+    countAlongLength: number;
+    countAlongWidth: number;
+    nxAxis: "L" | "W";
+    nyAxis: "L" | "W";
+  }> = [
+    {
+      countAlongLength: safeNx,
+      countAlongWidth: safeNy,
+      nxAxis: "L",
+      nyAxis: "W",
+    },
+    {
+      countAlongLength: safeNy,
+      countAlongWidth: safeNx,
+      nxAxis: "W",
+      nyAxis: "L",
+    },
+  ];
+  const orientations = getUniqueUnitOrientations(unitDims);
+  let bestMatch:
+    | (typeof candidates)[number] & {
+        inferredLayerHeight: number;
+        score: number;
+      }
+    | null = null;
+
+  for (const candidate of candidates) {
+    const unitLengthAlongBoxLength = boxDims.l / candidate.countAlongLength;
+    const unitWidthAlongBoxWidth = boxDims.w / candidate.countAlongWidth;
+
+    for (const orientation of orientations) {
+      const score =
+        getRelativeError(unitLengthAlongBoxLength, orientation.length) +
+        getRelativeError(unitWidthAlongBoxWidth, orientation.width);
+
+      if (bestMatch === null || score < bestMatch.score) {
+        bestMatch = {
+          ...candidate,
+          inferredLayerHeight: orientation.height,
+          score,
+        };
+      }
+    }
+  }
+
+  if (bestMatch) {
+    return {
+      countAlongLength: bestMatch.countAlongLength,
+      countAlongWidth: bestMatch.countAlongWidth,
+      nxAxis: bestMatch.nxAxis,
+      nyAxis: bestMatch.nyAxis,
+      inferredLayerHeight: bestMatch.inferredLayerHeight,
+    };
+  }
+
+  return {
+    countAlongLength: safeNx,
+    countAlongWidth: safeNy,
+    nxAxis: "L",
+    nyAxis: "W",
+    inferredLayerHeight: boxDims.h,
+  };
+};
+
+const resolveLayoutSegments = (
+  segments: PackingLayoutSegment[],
+  boxDims: { l: number; w: number; h: number },
+  unitDims: PackingDims,
+): ResolvedLayoutSegment[] => {
+  if (segments.length === 0) {
+    return [];
+  }
+
+  const inferred = segments.map((segment) => {
+    const direction = resolveLayerDirection(segment, boxDims, unitDims);
+    const safeNz = Math.max(1, Number.isFinite(segment.nz) ? Math.floor(segment.nz) : 1);
+    const rawSingleLayerHeight = Math.max(0, direction.inferredLayerHeight);
+    return {
+      ...segment,
+      nz: safeNz,
+      countAlongLength: direction.countAlongLength,
+      countAlongWidth: direction.countAlongWidth,
+      nxAxis: direction.nxAxis,
+      nyAxis: direction.nyAxis,
+      singleLayerHeight: rawSingleLayerHeight,
+      segmentHeight: rawSingleLayerHeight * safeNz,
+    };
+  });
+
+  const totalRawHeight = inferred.reduce((sum, segment) => sum + segment.segmentHeight, 0);
+  const scale = totalRawHeight > 0 ? boxDims.h / totalRawHeight : 0;
+  const fallbackSingleLayerHeight = boxDims.h / inferred.reduce((sum, segment) => sum + segment.nz, 0);
+
+  return inferred.map((segment) => {
+    if (scale > 0) {
+      const normalizedSingleLayerHeight = segment.singleLayerHeight * scale;
+      return {
+        ...segment,
+        singleLayerHeight: normalizedSingleLayerHeight,
+        segmentHeight: normalizedSingleLayerHeight * segment.nz,
+      };
+    }
+
+    return {
+      ...segment,
+      singleLayerHeight: fallbackSingleLayerHeight,
+      segmentHeight: fallbackSingleLayerHeight * segment.nz,
+    };
+  });
+};
+
+const DEPTH_PROJECTION_ANGLE_RAD = (32 * Math.PI) / 180;
+const DEPTH_PROJECTION_COS = Math.cos(DEPTH_PROJECTION_ANGLE_RAD);
+const DEPTH_PROJECTION_SIN = Math.sin(DEPTH_PROJECTION_ANGLE_RAD);
+
+const normalizePositive = (value: number): number =>
+  Number.isFinite(value) && value > 0 ? value : 0;
+
+const getProjectedPreviewDimensions = (
+  dims: { l: number; w: number; h: number },
+  limits: { maxProjectedWidth: number; maxProjectedHeight: number },
+): { length: number; height: number; depthX: number; depthY: number } => {
+  const safeLength = normalizePositive(dims.l);
+  const safeWidth = normalizePositive(dims.w);
+  const safeHeight = normalizePositive(dims.h);
+  const safeMaxProjectedWidth = Math.max(1, normalizePositive(limits.maxProjectedWidth));
+  const safeMaxProjectedHeight = Math.max(1, normalizePositive(limits.maxProjectedHeight));
+
+  if (!safeLength || !safeWidth || !safeHeight) {
+    return { length: 0, height: 0, depthX: 0, depthY: 0 };
+  }
+
+  const projectedWidthUnits = safeLength + safeWidth * DEPTH_PROJECTION_COS;
+  const projectedHeightUnits = safeHeight + safeWidth * DEPTH_PROJECTION_SIN;
+
+  if (!projectedWidthUnits || !projectedHeightUnits) {
+    return { length: 0, height: 0, depthX: 0, depthY: 0 };
+  }
+
+  const scale = Math.min(
+    safeMaxProjectedWidth / projectedWidthUnits,
+    safeMaxProjectedHeight / projectedHeightUnits,
+  );
+  const toPixel = (value: number) => Math.max(1, Math.round(value * scale));
+
+  return {
+    length: toPixel(safeLength),
+    height: toPixel(safeHeight),
+    depthX: toPixel(safeWidth * DEPTH_PROJECTION_COS),
+    depthY: toPixel(safeWidth * DEPTH_PROJECTION_SIN),
+  };
+};
 
 const getSkuComputed = (
   sku: SkuConfig,
@@ -239,6 +530,8 @@ const getSkuComputed = (
     physical: pricingPhysical,
     targetRate: sku.targetRatePercent / 100,
     targetRateMode: sku.targetRateMode,
+    returnRate: sku.returnRatePercent / 100,
+    discountRate: sku.discountRatePercent / 100,
   });
 
   return {
@@ -331,6 +624,55 @@ const App = () => {
     activeComputed.pricingSummary.predictedSellingPrice,
     activeSku.costs.usdToCnyRate,
   );
+  const discountedPriceUsd = calculateCnyToUsd(
+    activeComputed.pricingSummary.discountedSellingPrice,
+    activeSku.costs.usdToCnyRate,
+  );
+  const selectedPackingResult = activeComputed.selectedResult;
+  const selectedLayoutLayers = useMemo<ResolvedLayoutLayer[]>(() => {
+    if (!selectedPackingResult) {
+      return [];
+    }
+
+    const resolvedSegments = resolveLayoutSegments(
+      parseLayoutSegments(selectedPackingResult.layout),
+      selectedPackingResult.dims,
+      activeSku.dims,
+    );
+    const layers: ResolvedLayoutLayer[] = [];
+
+    for (const segment of resolvedSegments) {
+      for (let i = 0; i < segment.nz; i += 1) {
+        layers.push({
+          nx: segment.nx,
+          ny: segment.ny,
+          nz: 1,
+          countAlongLength: segment.countAlongLength,
+          countAlongWidth: segment.countAlongWidth,
+          nxAxis: segment.nxAxis,
+          nyAxis: segment.nyAxis,
+          layerHeight: segment.singleLayerHeight,
+        });
+      }
+    }
+
+    return layers;
+  }, [activeSku.dims, selectedPackingResult]);
+  const selectedLayerBoundaries = getBoundaryRatiosByValues(
+    selectedLayoutLayers.map((layer) => layer.layerHeight),
+  );
+  const selectedPreview = selectedPackingResult
+    ? getProjectedPreviewDimensions(selectedPackingResult.dims, {
+        maxProjectedWidth: 138,
+        maxProjectedHeight: 100,
+      })
+    : null;
+  const selectedPreviewFrontX = 26;
+  const selectedPreviewFrontWidth = selectedPreview?.length ?? 0;
+  const selectedPreviewFrontHeight = selectedPreview?.height ?? 0;
+  const selectedPreviewFrontY = 142 - selectedPreviewFrontHeight;
+  const selectedPreviewDepthX = selectedPreview?.depthX ?? 0;
+  const selectedPreviewDepthY = selectedPreview?.depthY ?? 0;
   const activeWarehouse = getWarehouseById(activeSku.destinationWarehouseId);
   const warehousesByRegion = useMemo(
     () =>
@@ -422,7 +764,7 @@ const App = () => {
                         </div>
                         <div className="mt-1 text-xs text-gray-500">堆叠: {snapshot.layout}</div>
                         <div className="text-xs text-gray-500">
-                          建议售价: {toCurrencyText(snapshot.suggestedPrice)}
+                          建议标价: {toCurrencyText(snapshot.suggestedPrice)}
                         </div>
                       </button>
                       {skus.length > 1 ? (
@@ -635,7 +977,26 @@ const App = () => {
                 {activeComputed.packingResults.length > 0 ? (
                   activeComputed.packingResults.map((result, index) => {
                     const isSelected = index === activeComputed.effectiveSelectedIndex;
-                    const preview = getNormalizedPreviewDimensions(result.dims, 36, 8);
+                    const preview = getProjectedPreviewDimensions(result.dims, {
+                      maxProjectedWidth: 58,
+                      maxProjectedHeight: 40,
+                    });
+                    const resolvedLayoutSegments = resolveLayoutSegments(
+                      parseLayoutSegments(result.layout),
+                      result.dims,
+                      activeSku.dims,
+                    );
+                    const layerBoundaries = getBoundaryRatiosByValues(
+                      resolvedLayoutSegments.map((segment) => segment.segmentHeight),
+                    );
+                    const frontX = 16;
+                    const frontY = 52 - preview.height;
+                    const frontWidth = preview.length;
+                    const frontHeight = preview.height;
+                    const depthX = preview.depthX;
+                    const depthY = preview.depthY;
+                    const axisColor = isSelected ? "#1d4ed8" : "#64748b";
+                    const axisTextColor = isSelected ? "#1e3a8a" : "#475569";
                     return (
                       <button
                         key={`${result.layout}-${index}`}
@@ -652,7 +1013,7 @@ const App = () => {
                             : "border-gray-200 bg-white hover:bg-gray-50"
                         }`}
                       >
-                        <div className="flex items-center justify-between gap-3">
+                        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                           <div>
                             <div className="text-xs font-medium text-gray-500">
                               方案 {index + 1}
@@ -666,22 +1027,178 @@ const App = () => {
                             <div className="text-sm text-gray-600">
                               {result.dims.l} × {result.dims.w} × {result.dims.h} {activeSku.unit}
                             </div>
+                            {resolvedLayoutSegments.length > 0 ? (
+                              <div className="mt-2 flex flex-wrap gap-1.5">
+                                {resolvedLayoutSegments.map((segment, segmentIndex) => {
+                                  const xDividers = getGridDividerRatios(
+                                    segment.countAlongLength,
+                                    5,
+                                  );
+                                  const yDividers = getGridDividerRatios(
+                                    segment.countAlongWidth,
+                                    5,
+                                  );
+                                  const segmentPreview = getNormalizedLayerGridPreview(
+                                    result.dims.l,
+                                    result.dims.w,
+                                    22,
+                                  );
+                                  const segmentRectX = (28 - segmentPreview.width) / 2;
+                                  const segmentRectY = (28 - segmentPreview.height) / 2;
+                                  return (
+                                    <div
+                                      key={`${result.layout}-segment-${segmentIndex}`}
+                                      className={`flex items-center gap-2 rounded-md border px-2 py-1 text-[11px] ${
+                                        isSelected
+                                          ? "border-blue-200 bg-blue-100/70 text-blue-800"
+                                          : "border-gray-200 bg-gray-50 text-gray-600"
+                                      }`}
+                                    >
+                                      <svg viewBox="0 0 28 28" className="h-7 w-7 shrink-0">
+                                        <rect
+                                          x={segmentRectX}
+                                          y={segmentRectY}
+                                          width={segmentPreview.width}
+                                          height={segmentPreview.height}
+                                          fill={isSelected ? "#dbeafe" : "#f8fafc"}
+                                          stroke={isSelected ? "#2563eb" : "#94a3b8"}
+                                          strokeWidth="1"
+                                        />
+                                        {xDividers.map((ratio) => (
+                                          <line
+                                            key={`x-${ratio}`}
+                                            x1={segmentRectX + segmentPreview.width * ratio}
+                                            y1={segmentRectY}
+                                            x2={segmentRectX + segmentPreview.width * ratio}
+                                            y2={segmentRectY + segmentPreview.height}
+                                            stroke={isSelected ? "#93c5fd" : "#cbd5e1"}
+                                            strokeWidth="0.7"
+                                          />
+                                        ))}
+                                        {yDividers.map((ratio) => (
+                                          <line
+                                            key={`y-${ratio}`}
+                                            x1={segmentRectX}
+                                            y1={segmentRectY + segmentPreview.height * ratio}
+                                            x2={segmentRectX + segmentPreview.width}
+                                            y2={segmentRectY + segmentPreview.height * ratio}
+                                            stroke={isSelected ? "#93c5fd" : "#cbd5e1"}
+                                            strokeWidth="0.7"
+                                          />
+                                        ))}
+                                      </svg>
+                                      <div className="leading-tight">
+                                        <div className="font-medium">
+                                          {getLayerLabel(segmentIndex, resolvedLayoutSegments.length)}
+                                        </div>
+                                        <div className="font-semibold">
+                                          {segment.nx} × {segment.ny} × {segment.nz}
+                                        </div>
+                                        <div className="text-[10px] text-gray-500">
+                                          nx→{segment.nxAxis}，ny→{segment.nyAxis}
+                                        </div>
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            ) : null}
                           </div>
 
                           <div className="flex items-center gap-3">
-                            <svg viewBox="0 0 120 70" className="h-[48px] w-[92px] shrink-0">
-                              <rect
-                                x={12}
-                                y={60 - preview.height}
-                                width={preview.length}
-                                height={preview.height}
-                                fill={isSelected ? "#dbeafe" : "#f3f4f6"}
-                                stroke={isSelected ? "#2563eb" : "#9ca3af"}
-                                strokeWidth="1.2"
+                            <svg viewBox="0 0 130 84" className="h-[62px] w-[104px] shrink-0">
+                              <polygon
+                                points={`${frontX},${frontY} ${frontX + depthX},${frontY - depthY} ${
+                                  frontX + depthX + frontWidth
+                                },${frontY - depthY} ${frontX + frontWidth},${frontY}`}
+                                fill={isSelected ? "#bfdbfe" : "#e5e7eb"}
+                                stroke={isSelected ? "#1d4ed8" : "#9ca3af"}
+                                strokeWidth="1"
                               />
+                              <polygon
+                                points={`${frontX + frontWidth},${frontY} ${
+                                  frontX + depthX + frontWidth
+                                },${frontY - depthY} ${frontX + depthX + frontWidth},${
+                                  frontY + frontHeight - depthY
+                                } ${frontX + frontWidth},${frontY + frontHeight}`}
+                                fill={isSelected ? "#93c5fd" : "#d1d5db"}
+                                stroke={isSelected ? "#1d4ed8" : "#9ca3af"}
+                                strokeWidth="1"
+                              />
+                              <rect
+                                x={frontX}
+                                y={frontY}
+                                width={frontWidth}
+                                height={frontHeight}
+                                fill={isSelected ? "#dbeafe" : "#f3f4f6"}
+                                stroke={isSelected ? "#1d4ed8" : "#9ca3af"}
+                                strokeWidth="1"
+                              />
+                              {layerBoundaries.map((ratio) => (
+                                <line
+                                  key={`layer-${ratio}`}
+                                  x1={frontX}
+                                  y1={frontY + frontHeight * ratio}
+                                  x2={frontX + frontWidth}
+                                  y2={frontY + frontHeight * ratio}
+                                  stroke={isSelected ? "#60a5fa" : "#cbd5e1"}
+                                  strokeWidth="0.9"
+                                />
+                              ))}
+                              <line
+                                x1={frontX}
+                                y1={frontY + frontHeight + 6}
+                                x2={frontX + frontWidth}
+                                y2={frontY + frontHeight + 6}
+                                stroke={axisColor}
+                                strokeWidth="0.8"
+                              />
+                              <line
+                                x1={frontX + frontWidth + 2}
+                                y1={frontY + frontHeight + 1}
+                                x2={frontX + frontWidth + depthX + 2}
+                                y2={frontY + frontHeight - depthY + 1}
+                                stroke={axisColor}
+                                strokeWidth="0.8"
+                              />
+                              <line
+                                x1={frontX - 6}
+                                y1={frontY + frontHeight}
+                                x2={frontX - 6}
+                                y2={frontY}
+                                stroke={axisColor}
+                                strokeWidth="0.8"
+                              />
+                              <text
+                                x={frontX + frontWidth / 2}
+                                y={frontY + frontHeight + 12}
+                                textAnchor="middle"
+                                fontSize="5.6"
+                                fill={axisTextColor}
+                              >
+                                L {result.dims.l}
+                              </text>
+                              <text
+                                x={frontX + frontWidth + depthX / 2 + 3}
+                                y={frontY + frontHeight - depthY / 2 + 1}
+                                textAnchor="middle"
+                                fontSize="5.6"
+                                fill={axisTextColor}
+                              >
+                                W {result.dims.w}
+                              </text>
+                              <text
+                                x={frontX - 9}
+                                y={frontY + frontHeight / 2}
+                                textAnchor="middle"
+                                fontSize="5.6"
+                                fill={axisTextColor}
+                              >
+                                H {result.dims.h}
+                              </text>
                             </svg>
                             <div className="text-right text-xs text-gray-500">
-                              <div>长宽比</div>
+                              <div>立体预览</div>
                               <div className="font-bold text-gray-700">{result.ratio} : 1</div>
                             </div>
                             <ChevronRight
@@ -701,6 +1218,223 @@ const App = () => {
                   </div>
                 )}
               </div>
+
+              {selectedPackingResult && selectedPreview ? (
+                <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50/70 p-4">
+                  <div className="mb-3 flex items-center justify-between">
+                    <h3 className="text-sm font-semibold text-slate-800">摆放方式大图</h3>
+                    <span className="rounded-full bg-slate-200 px-2 py-0.5 text-[11px] font-semibold text-slate-700">
+                      共 {selectedLayoutLayers.length} 层
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
+                    <div className="rounded-lg border border-slate-200 bg-white p-3">
+                      <svg viewBox="0 0 250 170" className="h-[180px] w-full">
+                        <polygon
+                          points={`${selectedPreviewFrontX},${selectedPreviewFrontY} ${
+                            selectedPreviewFrontX + selectedPreviewDepthX
+                          },${selectedPreviewFrontY - selectedPreviewDepthY} ${
+                            selectedPreviewFrontX + selectedPreviewDepthX + selectedPreviewFrontWidth
+                          },${selectedPreviewFrontY - selectedPreviewDepthY} ${
+                            selectedPreviewFrontX + selectedPreviewFrontWidth
+                          },${selectedPreviewFrontY}`}
+                          fill="#bfdbfe"
+                          stroke="#1d4ed8"
+                          strokeWidth="1.2"
+                        />
+                        <polygon
+                          points={`${selectedPreviewFrontX + selectedPreviewFrontWidth},${
+                            selectedPreviewFrontY
+                          } ${
+                            selectedPreviewFrontX + selectedPreviewDepthX + selectedPreviewFrontWidth
+                          },${selectedPreviewFrontY - selectedPreviewDepthY} ${
+                            selectedPreviewFrontX + selectedPreviewDepthX + selectedPreviewFrontWidth
+                          },${selectedPreviewFrontY + selectedPreviewFrontHeight - selectedPreviewDepthY} ${
+                            selectedPreviewFrontX + selectedPreviewFrontWidth
+                          },${selectedPreviewFrontY + selectedPreviewFrontHeight}`}
+                          fill="#93c5fd"
+                          stroke="#1d4ed8"
+                          strokeWidth="1.2"
+                        />
+                        <rect
+                          x={selectedPreviewFrontX}
+                          y={selectedPreviewFrontY}
+                          width={selectedPreviewFrontWidth}
+                          height={selectedPreviewFrontHeight}
+                          fill="#dbeafe"
+                          stroke="#1d4ed8"
+                          strokeWidth="1.2"
+                        />
+                        {selectedLayerBoundaries.map((ratio) => (
+                          <line
+                            key={`selected-layer-${ratio}`}
+                            x1={selectedPreviewFrontX}
+                            y1={selectedPreviewFrontY + selectedPreviewFrontHeight * ratio}
+                            x2={selectedPreviewFrontX + selectedPreviewFrontWidth}
+                            y2={selectedPreviewFrontY + selectedPreviewFrontHeight * ratio}
+                            stroke="#60a5fa"
+                            strokeWidth="1"
+                          />
+                        ))}
+                        <line
+                          x1={selectedPreviewFrontX}
+                          y1={selectedPreviewFrontY + selectedPreviewFrontHeight + 12}
+                          x2={selectedPreviewFrontX + selectedPreviewFrontWidth}
+                          y2={selectedPreviewFrontY + selectedPreviewFrontHeight + 12}
+                          stroke="#1e3a8a"
+                          strokeWidth="1.2"
+                        />
+                        <line
+                          x1={selectedPreviewFrontX + selectedPreviewFrontWidth + 3}
+                          y1={selectedPreviewFrontY + selectedPreviewFrontHeight + 1}
+                          x2={
+                            selectedPreviewFrontX +
+                            selectedPreviewFrontWidth +
+                            selectedPreviewDepthX +
+                            3
+                          }
+                          y2={
+                            selectedPreviewFrontY +
+                            selectedPreviewFrontHeight -
+                            selectedPreviewDepthY +
+                            1
+                          }
+                          stroke="#1e3a8a"
+                          strokeWidth="1.2"
+                        />
+                        <line
+                          x1={selectedPreviewFrontX - 10}
+                          y1={selectedPreviewFrontY + selectedPreviewFrontHeight}
+                          x2={selectedPreviewFrontX - 10}
+                          y2={selectedPreviewFrontY}
+                          stroke="#1e3a8a"
+                          strokeWidth="1.2"
+                        />
+                        <text
+                          x={selectedPreviewFrontX + selectedPreviewFrontWidth / 2}
+                          y={selectedPreviewFrontY + selectedPreviewFrontHeight + 24}
+                          textAnchor="middle"
+                          fontSize="9"
+                          fill="#1e3a8a"
+                        >
+                          L {selectedPackingResult.dims.l} {activeSku.unit}
+                        </text>
+                        <text
+                          x={
+                            selectedPreviewFrontX +
+                            selectedPreviewFrontWidth +
+                            selectedPreviewDepthX / 2 +
+                            6
+                          }
+                          y={
+                            selectedPreviewFrontY +
+                            selectedPreviewFrontHeight -
+                            selectedPreviewDepthY / 2 +
+                            2
+                          }
+                          textAnchor="middle"
+                          fontSize="8.5"
+                          fill="#1e3a8a"
+                        >
+                          W {selectedPackingResult.dims.w} {activeSku.unit}
+                        </text>
+                        <text
+                          x={selectedPreviewFrontX - 14}
+                          y={selectedPreviewFrontY + selectedPreviewFrontHeight / 2}
+                          textAnchor="middle"
+                          fontSize="8.5"
+                          fill="#1e3a8a"
+                        >
+                          H {selectedPackingResult.dims.h} {activeSku.unit}
+                        </text>
+                      </svg>
+                      <p className="mt-2 text-center text-xs font-medium text-slate-600">
+                        外箱 {selectedPackingResult.dims.l} × {selectedPackingResult.dims.w} ×{" "}
+                        {selectedPackingResult.dims.h} {activeSku.unit}
+                      </p>
+                    </div>
+
+                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      {selectedLayoutLayers.map((layer, layerIndex) => {
+                        const xDividers = getGridDividerRatios(layer.countAlongLength, 6);
+                        const yDividers = getGridDividerRatios(layer.countAlongWidth, 6);
+                        const units = layer.nx * layer.ny;
+                        const layerHeight = layer.layerHeight;
+                        const layerPreview = getNormalizedLayerGridPreview(
+                          selectedPackingResult.dims.l,
+                          selectedPackingResult.dims.w,
+                          44,
+                        );
+                        const layerRectX = (56 - layerPreview.width) / 2;
+                        const layerRectY = (56 - layerPreview.height) / 2;
+
+                        return (
+                          <div
+                            key={`selected-layer-grid-${layerIndex}`}
+                            className="rounded-lg border border-slate-200 bg-white p-2.5"
+                          >
+                            <div className="mb-1 flex items-center justify-between text-[11px]">
+                              <span className="font-semibold text-slate-700">
+                                {getLayerLabel(layerIndex, selectedLayoutLayers.length)}
+                              </span>
+                              <span className="text-slate-500">{units} 件</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <svg viewBox="0 0 56 56" className="h-12 w-12 shrink-0">
+                                <rect
+                                  x={layerRectX}
+                                  y={layerRectY}
+                                  width={layerPreview.width}
+                                  height={layerPreview.height}
+                                  fill="#f8fafc"
+                                  stroke="#94a3b8"
+                                  strokeWidth="1.1"
+                                />
+                                {xDividers.map((ratio) => (
+                                  <line
+                                    key={`selected-x-${layerIndex}-${ratio}`}
+                                    x1={layerRectX + layerPreview.width * ratio}
+                                    y1={layerRectY}
+                                    x2={layerRectX + layerPreview.width * ratio}
+                                    y2={layerRectY + layerPreview.height}
+                                    stroke="#cbd5e1"
+                                    strokeWidth="0.8"
+                                  />
+                                ))}
+                                {yDividers.map((ratio) => (
+                                  <line
+                                    key={`selected-y-${layerIndex}-${ratio}`}
+                                    x1={layerRectX}
+                                    y1={layerRectY + layerPreview.height * ratio}
+                                    x2={layerRectX + layerPreview.width}
+                                    y2={layerRectY + layerPreview.height * ratio}
+                                    stroke="#cbd5e1"
+                                    strokeWidth="0.8"
+                                  />
+                                ))}
+                              </svg>
+                              <div className="leading-tight text-xs">
+                                <div className="font-semibold text-slate-700">
+                                  {layer.nx} 行 × {layer.ny} 列
+                                </div>
+                                <div className="text-slate-500">
+                                  方向 nx→{layer.nxAxis}，ny→{layer.nyAxis}
+                                </div>
+                                <div className="text-slate-500">
+                                  尺寸 {toDimensionText(selectedPackingResult.dims.l)} ×{" "}
+                                  {toDimensionText(selectedPackingResult.dims.w)} ×{" "}
+                                  {toDimensionText(layerHeight)} {activeSku.unit}
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              ) : null}
             </section>
 
             <section className="rounded-2xl border border-gray-100 bg-white p-5 shadow-sm">
@@ -973,9 +1707,51 @@ const App = () => {
                     className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm outline-none transition-all focus:ring-2 focus:ring-blue-500"
                   />
                 </div>
+                <div>
+                  <label className="mb-1 block text-xs font-bold uppercase text-gray-400">
+                    退货率 (%)
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={100}
+                    step="0.1"
+                    value={activeSku.returnRatePercent}
+                    onChange={(event) =>
+                      patchActiveSku((sku) => ({
+                        ...sku,
+                        returnRatePercent: clampPercent(
+                          Number.parseFloat(event.target.value) || 0,
+                        ),
+                      }))
+                    }
+                    className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm outline-none transition-all focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs font-bold uppercase text-gray-400">
+                    折扣率 (%)（8 折 = 80）
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={100}
+                    step="0.1"
+                    value={activeSku.discountRatePercent}
+                    onChange={(event) =>
+                      patchActiveSku((sku) => ({
+                        ...sku,
+                        discountRatePercent: clampPercent(
+                          Number.parseFloat(event.target.value) || 0,
+                        ),
+                      }))
+                    }
+                    className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm outline-none transition-all focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
               </div>
               <p className="mt-3 text-xs text-gray-500">
-                当前流程：外箱规格与堆叠方式确定后，自动驱动体积重/计费重，再反推目标售价。
+                当前流程：先按目标利率反推“退货后有效收入”，再结合退货率与折扣率，计算折后目标成交价与折前建议标价。
               </p>
             </section>
           </main>
@@ -1106,15 +1882,33 @@ const App = () => {
 
                 <div className="mt-2 border-t border-gray-100 pt-3">
                   <div className="flex items-center justify-between">
-                    <span className="font-medium text-gray-600">建议售价</span>
+                    <span className="font-medium text-gray-600">建议标价（折前）</span>
                     <span className="text-xl font-black text-blue-600">
                       {toCurrencyText(activeComputed.pricingSummary.predictedSellingPrice)} 元
                     </span>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-500">建议售价（美元）</span>
+                    <span className="text-gray-500">建议标价（美元）</span>
                     <span className="font-semibold text-blue-600">
                       {suggestedPriceUsd === null ? "--" : `$${suggestedPriceUsd.toFixed(2)}`}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-gray-500">目标成交价（折后）</span>
+                    <span className="font-semibold text-blue-600">
+                      {toCurrencyText(activeComputed.pricingSummary.discountedSellingPrice)}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-gray-500">目标成交价（美元）</span>
+                    <span className="font-semibold text-blue-600">
+                      {discountedPriceUsd === null ? "--" : `$${discountedPriceUsd.toFixed(2)}`}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-gray-500">退货后有效收入</span>
+                    <span className="font-semibold text-gray-700">
+                      {toCurrencyText(activeComputed.pricingSummary.effectiveRevenueAfterReturns)}
                     </span>
                   </div>
                   <div className="mt-1 flex items-center justify-between">
@@ -1140,7 +1934,7 @@ const App = () => {
 
               {activeComputed.pricingSummary.predictedSellingPrice === null ? (
                 <p className="mt-3 text-xs text-orange-600">
-                  按“售价利润率”计算时，目标利率必须小于 100%。
+                  参数无效：按“售价利润率”时目标利率必须小于 100%，退货率必须小于 100%，折扣率必须大于 0%。
                 </p>
               ) : null}
 

@@ -27,6 +27,8 @@ export type PricingInputs = {
   physical: PhysicalInputs;
   targetRate: number;
   targetRateMode: TargetRateMode;
+  returnRate: number;
+  discountRate: number;
 };
 
 export type PricingSummary = {
@@ -35,9 +37,22 @@ export type PricingSummary = {
   chargeableWeightKg: number;
   totalCost: number;
   predictedSellingPrice: number | null;
+  discountedSellingPrice: number | null;
+  effectiveRevenueAfterReturns: number | null;
   estimatedProfit: number | null;
   profitRateOnSalePrice: number | null;
   markupOnCost: number | null;
+};
+
+export type PricingAdjustmentInputs = {
+  returnRate: number;
+  discountRate: number;
+};
+
+type PricingTargets = {
+  listPriceBeforeDiscount: number;
+  discountedSellingPrice: number;
+  effectiveRevenueAfterReturns: number;
 };
 
 const toSafeNonNegative = (value: number): number => {
@@ -140,25 +155,57 @@ export const calculateFirstLegCostFromRate = (
   return roundTo(safeWeight * safeRate, 2);
 };
 
-export const calculateTargetSellingPrice = (
+const calculatePricingTargets = (
   totalCost: number,
   targetRate: number,
   targetRateMode: TargetRateMode,
-): number | null => {
+  adjustments: PricingAdjustmentInputs,
+): PricingTargets | null => {
   const safeTotalCost = toSafeNonNegative(totalCost);
   if (!Number.isFinite(targetRate) || targetRate < 0) {
     return null;
   }
 
+  const safeReturnRate = toSafeNonNegative(adjustments.returnRate);
+  const safeDiscountRate = toSafeNonNegative(adjustments.discountRate);
+  if (!Number.isFinite(adjustments.returnRate) || !Number.isFinite(adjustments.discountRate)) {
+    return null;
+  }
+  if (safeReturnRate >= 1 || safeDiscountRate <= 0) {
+    return null;
+  }
+
+  let effectiveRevenueAfterReturns: number;
   if (targetRateMode === "margin_on_sale_price") {
     if (targetRate >= 1) {
       return null;
     }
-
-    return roundTo(safeTotalCost / (1 - targetRate), 2);
+    effectiveRevenueAfterReturns = safeTotalCost / (1 - targetRate);
+  } else {
+    effectiveRevenueAfterReturns = safeTotalCost * (1 + targetRate);
   }
 
-  return roundTo(safeTotalCost * (1 + targetRate), 2);
+  const discountedSellingPrice = effectiveRevenueAfterReturns / (1 - safeReturnRate);
+  const listPriceBeforeDiscount = discountedSellingPrice / safeDiscountRate;
+  return {
+    listPriceBeforeDiscount,
+    discountedSellingPrice,
+    effectiveRevenueAfterReturns,
+  };
+};
+
+export const calculateTargetSellingPrice = (
+  totalCost: number,
+  targetRate: number,
+  targetRateMode: TargetRateMode,
+  adjustments: PricingAdjustmentInputs,
+): number | null => {
+  const targets = calculatePricingTargets(totalCost, targetRate, targetRateMode, adjustments);
+  if (targets === null) {
+    return null;
+  }
+
+  return roundTo(targets.listPriceBeforeDiscount, 2);
 };
 
 export const summarizePricing = (inputs: PricingInputs): PricingSummary => {
@@ -172,23 +219,45 @@ export const summarizePricing = (inputs: PricingInputs): PricingSummary => {
     totalCost,
     inputs.targetRate,
     inputs.targetRateMode,
+    {
+      returnRate: inputs.returnRate,
+      discountRate: inputs.discountRate,
+    },
   );
+  const targets = calculatePricingTargets(totalCost, inputs.targetRate, inputs.targetRateMode, {
+    returnRate: inputs.returnRate,
+    discountRate: inputs.discountRate,
+  });
+  const discountedSellingPrice =
+    targets === null ? null : roundTo(targets.discountedSellingPrice, 2);
+  const effectiveRevenueAfterReturns =
+    targets === null ? null : roundTo(targets.effectiveRevenueAfterReturns, 2);
 
-  if (predictedSellingPrice === null || predictedSellingPrice <= 0 || totalCost <= 0) {
+  if (
+    predictedSellingPrice === null ||
+    predictedSellingPrice <= 0 ||
+    totalCost <= 0 ||
+    discountedSellingPrice === null ||
+    discountedSellingPrice <= 0 ||
+    effectiveRevenueAfterReturns === null ||
+    effectiveRevenueAfterReturns <= 0
+  ) {
     return {
       firstLegChannel: inputs.firstLegChannel,
       volumetricWeightKg,
       chargeableWeightKg,
       totalCost,
       predictedSellingPrice,
+      discountedSellingPrice,
+      effectiveRevenueAfterReturns,
       estimatedProfit: null,
       profitRateOnSalePrice: null,
       markupOnCost: null,
     };
   }
 
-  const estimatedProfit = roundTo(predictedSellingPrice - totalCost, 2);
-  const profitRateOnSalePrice = estimatedProfit / predictedSellingPrice;
+  const estimatedProfit = roundTo(effectiveRevenueAfterReturns - totalCost, 2);
+  const profitRateOnSalePrice = estimatedProfit / effectiveRevenueAfterReturns;
   const markupOnCost = estimatedProfit / totalCost;
 
   return {
@@ -197,6 +266,8 @@ export const summarizePricing = (inputs: PricingInputs): PricingSummary => {
     chargeableWeightKg,
     totalCost,
     predictedSellingPrice,
+    discountedSellingPrice,
+    effectiveRevenueAfterReturns,
     estimatedProfit,
     profitRateOnSalePrice,
     markupOnCost,
